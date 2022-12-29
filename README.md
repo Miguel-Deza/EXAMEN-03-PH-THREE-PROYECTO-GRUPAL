@@ -161,3 +161,121 @@ for (auto it = tree.begin_knn_query(5, {1, 1, 1}, DistanceL1<3>())); it != tree.
 ```
 
 <a id="converters"></a>
+
+## Converters
+
+El PH-Tree solo puede procesar internamente claves enteras. Para utilizar coordenadas de punto flotante, las coordenadas de punto flotante deben convertirse a coordenadas enteras. PhTreeD y PhTreeBoxD usan por defecto las funciones PreprocessIEEE y PostProcessIEEE. El procesador IEEE es un convertidor sin pérdidas (en términos de precisión numérica) que simplemente toma los 64 bits de un valor doble y los trata como si fueran un número entero de 64 bits (es un poco más complicado que eso, consulte la discusión en los documentos a los que se hace referencia). arriba). En otras palabras, trata la representación IEEE 754 del valor doble como un número entero, de ahí el nombre de convertidor IEEE.
+
+La conversión IEEE es rápida y reversible sin pérdida de precisión. Sin embargo, se ha demostrado que otros convertidores pueden generar índices que son hasta un 20 % más rápidos. Una alternativa útil es un convertidor de multiplicación que convierte el punto flotante en un número entero mediante la multiplicación y la conversión:
+
+```C++
+double my_float = ...;
+// Convert to int 
+std::int64_t my_int = (std::int64_t) my_float * 1000000.;
+
+// Convert back
+double resultung_float = ((double)my_int) / 1000000.;
+
+```
+
+Es obvio que este enfoque conduce a una pérdida de precisión numérica. Además, la pérdida de precisión depende del rango real de los valores dobles y la constante. La constante elegida probablemente debería ser lo más grande posible pero lo suficientemente pequeña como para que los valores convertidos no excedan el límite de 64 bits de std::int64_t. Tenga en cuenta que PH-Tree proporciona varias implementaciones de ConverterMultiply para punto/caja y doble/flotante.
+
+```C++
+template <dimension_t DIM>
+struct MyConverterMultiply : public ConverterPointBase<DIM, double, scalar_64_t> {
+    explicit MyConverterMultiply(double multiplier)
+    : multiplier_{multiplier}, divider_{1. / multiplier} {}
+
+    [[nodiscard]] PhPoint<DIM> pre(const PhPointD<DIM>& point) const {
+        PhPoint<DIM> out;
+        for (dimension_t i = 0; i < DIM; ++i) {
+            out[i] = point[i] * multiplier_;
+        }
+        return out;
+    }
+
+    [[nodiscard]] PhPointD<DIM> post(const PhPoint<DIM>& in) const {
+        PhPointD<DIM> out;
+        for (dimension_t i = 0; i < DIM; ++i) {
+            out[i] = ((double)in[i]) * divider_;
+        }
+        return out;
+    }
+
+    [[nodiscard]] auto pre_query(const PhBoxD<DIM>& query_box) const {
+        return PhBox{pre(query_box.min()), pre(query_box.max())};
+    }
+
+    const double multiplier_;
+    const double divider_;
+};
+
+template <dimension_t DIM, typename T>
+using MyTree = PhTreeD<DIM, T, MyConverterMultiply<DIM>>;
+
+void test() {
+    MyConverterMultiply<3> converter{1000000};
+    MyTree<3, MyData> tree(converter);
+    ...  // use the tree
+}
+```
+También vale la pena probar constantes que sean 1 o 2 órdenes de magnitud más pequeñas o más grandes que este valor máximo. La experiencia muestra que esto puede afectar el rendimiento de las consultas hasta en un 10 %. Esto se debe a una estructura más compacta del árbol de índice resultante.
+
+### Tipos de claves personalizadas
+
+Con convertidores personalizados también es posible usar sus propias clases personalizadas como claves (en lugar de PhPointD o PhBoxF). El siguiente ejemplo definió tipos personalizados MyPoint y MyBox y un convertidor que permite usarlos con un PhTree:
+
+```C++
+struct MyPoint {
+    double x_;
+    double y_;
+    double z_;
+};
+
+using MyBox = std::pair<MyPoint, MyPoint>;
+
+class MyConverterMultiply : public ConverterBase<3, 3, double, scalar_64_t, MyPoint, MyBox> {
+    using BASE = ConverterPointBase<3, double, scalar_64_t>;
+    using PointInternal = typename BASE::KeyInternal;
+    using QueryBoxInternal = typename BASE::QueryBoxInternal;
+
+  public:
+    explicit MyConverterMultiply(double multiplier = 1000000)
+    : multiplier_{multiplier}, divider_{1. / multiplier} {}
+
+    [[nodiscard]] PointInternal pre(const MyPoint& point) const {
+        return {static_cast<long>(point.x_ * multiplier_),
+                static_cast<long>(point.y_ * multiplier_),
+                static_cast<long>(point.z_ * multiplier_)};
+    }
+
+    [[nodiscard]] MyPoint post(const PointInternal& in) const {
+        return {in[0] * divider_, in[1] * divider_, in[2] * divider_};
+    }
+
+    [[nodiscard]] QueryBoxInternal pre_query(const MyBox& box) const {
+        return {pre(box.first), pre(box.second)};
+    }
+
+  private:
+    const double multiplier_;
+    const double divider_;
+};
+
+void test() {
+    MyConverterMultiply tm;
+    PhTree<3, Id, MyConverterMultiply> tree(tm);
+    ... // use the tree
+}
+```
+
+### Restricciones
+
+- C++: Admite tipos de valor de T y T*, pero no T&
+- C++: Los tipos de retorno de find(), emplace(), ... difieren ligeramente de std::map, tienen la función first() , second() en lugar de campos del mismo nombre.
+- General: Los PH-Trees son mapas, es decir, cada coordenada puede contener solo una entrada. Para mantener múltiples valores por coordenada, utilice las implementaciones de PhTreeMultiMap.
+- General: PH-Trees ordena las entradas internamente en orden z (orden Morton). Sin embargo, el orden se basa en la representación de bits (sin signo) de las claves, por lo que las coordenadas negativas se devuelven después de las coordenadas positivas.
+- General: La implementación actual admite entre 2 y 63 dimensiones.
+- Diferencias con std::map: Hay varias diferencias con std::map. Más notablemente para los iteradores:
+begin()/end() no son comparables con < o >. Solo se admite it == tree.end() y it != tree.end().
+Valor de end(): el árbol no tiene un diseño de memoria lineal, por lo que no hay una definición útil de un puntero que apunte _después_ de la última entrada o de cualquier entrada. Esto debería ser irrelevante para el uso normal.
